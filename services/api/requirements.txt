@@ -1,0 +1,46 @@
+# services/api/requirements.txt
+# SYNAPSE FastAPI backend dependencies
+# Updated: replaced Cloudinary, google-cloud-vision, google-cloud-speech,
+# google-cloud-translate with Supabase Storage, pytesseract, openai-whisper, libretranslate.
+# Hosting moved from Google Cloud Run to Railway.app.
+
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi==0.115.0
+uvicorn[standard]==0.31.0
+python-multipart==0.0.12      # file upload support
+
+# ── HTTP client ───────────────────────────────────────────────────────────────
+httpx==0.27.2                  # async HTTP — used by Nominatim, OSRM, Overpass calls
+
+# ── Firebase ──────────────────────────────────────────────────────────────────
+firebase-admin==6.5.0          # Firestore + FCM + Auth (server-side)
+
+# ── AI / Gemini / ADK ─────────────────────────────────────────────────────────
+google-generativeai==0.8.3     # Gemini 2.5 Flash + Pro
+google-adk==1.0.0              # Agent Development Kit (multi-agent orchestration)
+
+# ── File storage — Supabase (replaces Cloudinary) ────────────────────────────
+supabase==2.5.0                # Supabase Storage client
+
+# ── OCR — pytesseract (replaces Cloud Vision API) ────────────────────────────
+pytesseract==0.3.10            # Python wrapper for Tesseract OCR engine
+Pillow==10.4.0                 # Image preprocessing before OCR
+# System dependency also required (install separately):
+#   apt-get install tesseract-ocr tesseract-ocr-all
+#   (tesseract-ocr-all includes all Indian script language packs)
+
+# ── Speech-to-text — Whisper (replaces Cloud Speech-to-Text) ─────────────────
+openai-whisper==20231117       # Local Whisper model — no API key, runs on Railway CPU
+# Note: downloads model weights on first run (~150MB for 'base' model)
+# Pre-warm with: python -c "import whisper; whisper.load_model('base')"
+
+# ── Translation — LibreTranslate (replaces Cloud Translation API) ─────────────
+libretranslate==1.3.9          # Local LibreTranslate OR use public endpoint
+# To use public endpoint instead, set LIBRETRANSLATE_URL in .env and skip local install
+
+# ── Email — Resend (replaces Gmail API) ──────────────────────────────────────
+resend==0.7.0                  # Transactional email — weekly digests, donor updates
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1           # .env file loading
+pydantic==2.7.0                # Data validation (FastAPI models)

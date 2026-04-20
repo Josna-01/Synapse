@@ -1,0 +1,65 @@
+name: synapse_volunteer
+description: SYNAPSE Volunteer Mobile App — community need dispatch platform
+
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ── Firebase ──────────────────────────────────────────────────────────────
+  firebase_core: ^3.0.0
+  firebase_auth: ^5.0.0
+  cloud_firestore: ^5.0.0
+  firebase_messaging: ^15.0.0          # FCM push notifications
+
+  # ── Maps — flutter_map + OpenStreetMap (replaces google_maps_flutter) ─────
+  flutter_map: ^6.0.0                  # Leaflet-style map widget for Flutter
+  latlong2: ^0.9.0                     # LatLng coordinate type used by flutter_map
+  # OpenStreetMap tile URL: https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png
+  # No API key required.
+
+  # ── Location & GPS ────────────────────────────────────────────────────────
+  geolocator: ^12.0.0                  # GPS check-in, proximity verification
+
+  # ── Notifications ─────────────────────────────────────────────────────────
+  flutter_local_notifications: ^17.0.0 # Show FCM notifications in foreground
+
+  # ── Networking ────────────────────────────────────────────────────────────
+  http: ^1.2.0                         # API calls to FastAPI backend
+
+  # ── Storage / Caching ─────────────────────────────────────────────────────
+  shared_preferences: ^2.2.0           # Offline task caching (works on 2G)
+  cached_network_image: ^3.3.0         # Cache volunteer profile images
+
+  # ── UI ────────────────────────────────────────────────────────────────────
+  flutter_svg: ^2.0.0
+  google_fonts: ^6.1.0                 # DM Sans typography (matches web dashboards)
+  fl_chart: ^0.67.0                    # Impact stats charts
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  build_runner: ^2.4.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/
+    - assets/icons/
+    - assets/geojson/              # Local GeoJSON for offline district boundaries
+
+  fonts:
+    - family: DMSans
+      fonts:
+        - asset: assets/fonts/DMSans-Regular.ttf
+        - asset: assets/fonts/DMSans-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/DMSans-Bold.ttf
+          weight: 700

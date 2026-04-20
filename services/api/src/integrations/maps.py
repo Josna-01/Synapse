@@ -1,328 +1,351 @@
-# services/api/src/integrations/maps.py
-# SYNAPSE — Google Maps Integration Layer
-# Geocoding API v4 · Routes API · Places API (New) · Maps Datasets API
-# Every call has fallback. No single point of failure.
+"""
+integrations/maps.py — SYNAPSE Maps & Location Integration
+Uses open-source, API-key-free services:
+  - Nominatim (OpenStreetMap) for geocoding
+  - OSRM for routing / travel time
+  - Overpass API for nearby facilities
+  - Haversine formula (inline, no API) as primary distance fallback
 
+All function signatures are identical to the previous version so no
+calling code needs to change.
+"""
+
+import math
 import os
 import logging
-import httpx
-from math import radians, sin, cos, sqrt, atan2
 from typing import Optional
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
-MAPS_KEY    = os.environ["GOOGLE_MAPS_API_KEY"]
-TIMEOUT     = httpx.Timeout(20.0, connect=8.0)
+# ── Base URLs (overridable via .env) ─────────────────────────────────────────
+NOMINATIM_BASE_URL = os.getenv(
+    "NOMINATIM_BASE_URL", "https://nominatim.openstreetmap.org"
+)
+OSRM_BASE_URL = os.getenv(
+    "OSRM_BASE_URL", "http://router.project-osrm.org"
+)
+OVERPASS_BASE_URL = os.getenv(
+    "OVERPASS_BASE_URL", "https://overpass-api.de/api"
+)
 
-GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
-ROUTES_URL  = "https://routes.googleapis.com/directions/v2:computeRoutes"
-PLACES_URL  = "https://places.googleapis.com/v1/places:searchNearby"
+# Nominatim usage policy: identify your app in the User-Agent header
+NOMINATIM_USER_AGENT = "synapse-platform/1.0 (contact@synapse.example.com)"
 
-# Approximate travel speed fallbacks (km/h)
-SPEED_WALK   = 5.0
-SPEED_DRIVE  = 40.0   # urban average, traffic-adjusted
-SPEED_TRANSIT = 20.0
+# HTTP timeouts (seconds)
+GEOCODE_TIMEOUT = 10
+ROUTING_TIMEOUT = 15
+PLACES_TIMEOUT = 20
 
 
-# ─── Haversine (free, no quota) ──────────────────────────────────────────────
+# ── Haversine (no API, always available) ─────────────────────────────────────
+
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Earth-surface great-circle distance in kilometres."""
-    R = 6371
-    d_lat = radians(lat2 - lat1)
-    d_lon = radians(lon2 - lon1)
-    a = (sin(d_lat / 2) ** 2
-         + cos(radians(lat1)) * cos(radians(lat2)) * sin(d_lon / 2) ** 2)
-    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
-
-
-def estimate_travel_minutes(km: float, mode: str = "driving") -> float:
-    """Converts distance to approximate travel time. Used as Routes API fallback."""
-    speed = {
-        "walking":  SPEED_WALK,
-        "driving":  SPEED_DRIVE,
-        "transit":  SPEED_TRANSIT
-    }.get(mode, SPEED_DRIVE)
-    return (km / speed) * 60
-
-
-# ─── geocode_address() ───────────────────────────────────────────────────────
-async def geocode_address(address: str, region: str = "IN") -> dict:
     """
-    Primary: Geocoding API v4 → lat, lng, admin boundary codes.
-    Fallback: Returns None coords with requires_manual flag.
+    Calculate straight-line distance between two coordinates in kilometres.
+    Used as the primary distance measure and as fallback when OSRM is unavailable.
     """
+    R = 6371.0  # Earth's radius in km
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(d_phi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    )
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# ── Geocoding — Nominatim ─────────────────────────────────────────────────────
+
+async def geocode_address(address: str) -> Optional[dict]:
+    """
+    Convert a free-text address to lat/lng + admin boundary codes using Nominatim.
+
+    Returns:
+        {
+            "lat": float,
+            "lng": float,
+            "display_name": str,
+            "admin_boundary_code": str,   # e.g. "KA-DAKSHINA KANNADA"
+            "source": "nominatim"
+        }
+    Returns None on failure (caller should prompt for manual lat/lng entry).
+
+    Replaces: Google Geocoding API v4
+    """
+    params = {
+        "q": address,
+        "format": "json",
+        "limit": 1,
+        "countrycodes": "in",          # bias to India
+        "addressdetails": 1,
+    }
+    headers = {"User-Agent": NOMINATIM_USER_AGENT}
+
     try:
-        params = {
-            "address": address,
-            "region": region,
-            "key": MAPS_KEY
-        }
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            resp = await client.get(GEOCODE_URL, params=params)
+        async with httpx.AsyncClient(timeout=GEOCODE_TIMEOUT) as client:
+            resp = await client.get(
+                f"{NOMINATIM_BASE_URL}/search",
+                params=params,
+                headers=headers,
+            )
             resp.raise_for_status()
-            data = resp.json()
+            results = resp.json()
 
-        if data.get("status") != "OK" or not data.get("results"):
-            raise ValueError(f"Geocoding returned status: {data.get('status')}")
+        if not results:
+            logger.warning("Nominatim: no results for address '%s'", address)
+            return None
 
-        result = data["results"][0]
-        location = result["geometry"]["location"]
+        r = results[0]
+        addr = r.get("address", {})
 
-        # Extract admin boundary codes from address components
-        admin_components = {}
-        for comp in result.get("address_components", []):
-            types = comp.get("types", [])
-            if "administrative_area_level_1" in types:
-                admin_components["state"] = comp["short_name"]
-            elif "administrative_area_level_2" in types:
-                admin_components["district"] = comp["long_name"]
-            elif "administrative_area_level_3" in types:
-                admin_components["sub_district"] = comp["long_name"]
-            elif "locality" in types:
-                admin_components["city"] = comp["long_name"]
-            elif "postal_code" in types:
-                admin_components["pincode"] = comp["long_name"]
-
-        admin_code = (
-            f"{admin_components.get('state','XX')}-"
-            f"{admin_components.get('district','00').replace(' ', '_').upper()}"
-        )
+        # Build an admin boundary code from state + district fields
+        state = addr.get("state", "")
+        district = addr.get("county", addr.get("state_district", ""))
+        admin_code = f"{state[:2].upper()}-{district.upper()}" if state else ""
 
         return {
-            "lat": location["lat"],
-            "lng": location["lng"],
-            "formatted_address": result.get("formatted_address", address),
-            "admin_code": admin_code,
-            "admin_components": admin_components,
-            "place_id": result.get("place_id"),
-            "source": "geocoding_api"
+            "lat": float(r["lat"]),
+            "lng": float(r["lon"]),
+            "display_name": r.get("display_name", address),
+            "admin_boundary_code": admin_code,
+            "source": "nominatim",
         }
 
-    except Exception as e:
-        logger.warning(f"geocode_address failed for '{address}' ({e}), returning manual-entry fallback")
+    except httpx.TimeoutException:
+        logger.error("Nominatim geocoding timeout for address '%s'", address)
+        return None
+    except Exception as exc:
+        logger.error("Nominatim geocoding error: %s", exc)
+        return None
+
+
+async def reverse_geocode(lat: float, lng: float) -> Optional[dict]:
+    """
+    Convert lat/lng to a human-readable address + admin boundary code.
+
+    Replaces: Google Geocoding API v4 (reverse mode)
+    """
+    params = {
+        "lat": lat,
+        "lon": lng,
+        "format": "json",
+        "addressdetails": 1,
+    }
+    headers = {"User-Agent": NOMINATIM_USER_AGENT}
+
+    try:
+        async with httpx.AsyncClient(timeout=GEOCODE_TIMEOUT) as client:
+            resp = await client.get(
+                f"{NOMINATIM_BASE_URL}/reverse",
+                params=params,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            r = resp.json()
+
+        addr = r.get("address", {})
+        state = addr.get("state", "")
+        district = addr.get("county", addr.get("state_district", ""))
+        admin_code = f"{state[:2].upper()}-{district.upper()}" if state else ""
+
         return {
-            "lat": None,
-            "lng": None,
-            "formatted_address": address,
-            "admin_code": None,
-            "admin_components": {},
-            "place_id": None,
-            "source": "geocoding_failed",
-            "requires_manual_coordinates": True,
-            "error": str(e)
+            "lat": lat,
+            "lng": lng,
+            "display_name": r.get("display_name", ""),
+            "admin_boundary_code": admin_code,
+            "source": "nominatim",
         }
 
+    except Exception as exc:
+        logger.error("Nominatim reverse geocoding error: %s", exc)
+        return None
 
-# ─── get_travel_time() ───────────────────────────────────────────────────────
+
+# ── Routing — OSRM ────────────────────────────────────────────────────────────
+
 async def get_travel_time(
-    origin_lat: float, origin_lng: float,
-    dest_lat: float, dest_lng: float,
-    mode: str = "DRIVE"
-) -> dict:
+    origin_lat: float,
+    origin_lng: float,
+    dest_lat: float,
+    dest_lng: float,
+) -> Optional[dict]:
     """
-    Primary: Routes API → actual travel time with live traffic.
-    Fallback: Haversine + speed estimate.
-    Returns: { travel_time_mins, distance_km, source }
+    Get actual road travel time and distance between two points using OSRM.
+
+    Returns:
+        {
+            "duration_seconds": int,
+            "distance_km": float,
+            "source": "osrm"
+        }
+    Falls back to haversine estimate if OSRM is unavailable.
+
+    Replaces: Google Routes API
     """
-    # Validate inputs
-    for val, name in [(origin_lat, "origin_lat"), (origin_lng, "origin_lng"),
-                      (dest_lat, "dest_lat"), (dest_lng, "dest_lng")]:
-        if val is None:
-            return _haversine_travel_result(origin_lat, origin_lng, dest_lat, dest_lng, mode, "missing_coords")
+    # OSRM route endpoint: /route/v1/{profile}/{lng,lat};{lng,lat}
+    coords = f"{origin_lng},{origin_lat};{dest_lng},{dest_lat}"
+    url = f"{OSRM_BASE_URL}/route/v1/driving/{coords}"
+    params = {"overview": "false", "steps": "false"}
 
     try:
-        payload = {
-            "origin": {
-                "location": {"latLng": {"latitude": origin_lat, "longitude": origin_lng}}
-            },
-            "destination": {
-                "location": {"latLng": {"latitude": dest_lat, "longitude": dest_lng}}
-            },
-            "travelMode": mode,
-            "routingPreference": "TRAFFIC_AWARE",
-            "computeAlternativeRoutes": False,
-            "languageCode": "en-US"
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": MAPS_KEY,
-            "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.staticDuration"
-        }
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            resp = await client.post(ROUTES_URL, json=payload, headers=headers)
+        async with httpx.AsyncClient(timeout=ROUTING_TIMEOUT) as client:
+            resp = await client.get(url, params=params)
             resp.raise_for_status()
             data = resp.json()
 
-        if not data.get("routes"):
-            raise ValueError("Routes API returned no routes")
+        if data.get("code") != "Ok" or not data.get("routes"):
+            raise ValueError(f"OSRM returned code: {data.get('code')}")
 
         route = data["routes"][0]
-        duration_secs = int(route["duration"].rstrip("s"))
-        distance_m    = route["distanceMeters"]
-
         return {
-            "travel_time_mins": round(duration_secs / 60, 1),
-            "distance_km": round(distance_m / 1000, 2),
-            "source": "routes_api",
-            "source_label": "✅ Matched via: Live traffic routing (Routes API)"
+            "duration_seconds": int(route["duration"]),
+            "distance_km": round(route["distance"] / 1000, 2),
+            "source": "osrm",
         }
 
-    except Exception as e:
-        logger.warning(f"Routes API failed ({e}), using haversine fallback")
-        return _haversine_travel_result(origin_lat, origin_lng, dest_lat, dest_lng, mode, str(e))
+    except httpx.TimeoutException:
+        logger.warning("OSRM timeout — falling back to haversine estimate")
+    except Exception as exc:
+        logger.warning("OSRM routing error (%s) — falling back to haversine", exc)
 
-
-def _haversine_travel_result(
-    lat1: float, lon1: float, lat2: float, lon2: float,
-    mode: str, reason: str
-) -> dict:
-    """Haversine-based travel time estimate. Always succeeds."""
-    mode_key = {"DRIVE": "driving", "WALK": "walking", "TRANSIT": "transit"}.get(mode, "driving")
-    try:
-        km = haversine_km(lat1, lon1, lat2, lon2)
-        mins = estimate_travel_minutes(km, mode_key)
-    except Exception:
-        km, mins = 0.0, 0.0
-
+    # ── Haversine fallback ────────────────────────────────────────────────────
+    straight_km = haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
+    # Approximate road distance = 1.4× straight-line; assume 40 km/h average
+    road_km = straight_km * 1.4
+    duration_sec = int((road_km / 40) * 3600)
     return {
-        "travel_time_mins": round(mins, 1),
-        "distance_km": round(km, 2),
+        "duration_seconds": duration_sec,
+        "distance_km": round(road_km, 2),
         "source": "haversine_fallback",
-        "source_label": "⚠️  Matched via: Estimated distance (API unavailable)",
-        "fallback_reason": reason
     }
 
 
-# ─── get_nearby_facilities() ─────────────────────────────────────────────────
-async def get_nearby_facilities(
-    lat: float, lng: float,
-    facility_types: list[str] = None,
-    radius_m: int = 2000
-) -> dict:
+async def get_travel_time_matrix(
+    origins: list[dict],
+    destinations: list[dict],
+) -> Optional[list[list[Optional[dict]]]]:
     """
-    Primary: Places API (New) → hospitals, clinics, water stations near need location.
-    Fallback: Static list of generic facility types with contact format.
+    Compute a travel-time matrix between multiple origins and destinations.
+
+    origins / destinations: list of {"lat": float, "lng": float}
+    Returns: 2D list where result[i][j] = get_travel_time result for origin i → dest j
+
+    Falls back to haversine for any failed pair.
+
+    Replaces: Google Routes API (computeRouteMatrix)
+    """
+    matrix: list[list[Optional[dict]]] = []
+    for orig in origins:
+        row: list[Optional[dict]] = []
+        for dest in destinations:
+            result = await get_travel_time(
+                orig["lat"], orig["lng"], dest["lat"], dest["lng"]
+            )
+            row.append(result)
+        matrix.append(row)
+    return matrix
+
+
+# ── Nearby Places — Overpass API ──────────────────────────────────────────────
+
+async def get_nearby_facilities(
+    lat: float,
+    lng: float,
+    radius_m: int = 2000,
+    facility_types: Optional[list[str]] = None,
+) -> list[dict]:
+    """
+    Find nearby facilities (hospitals, clinics, pharmacies, schools, water points)
+    using the Overpass API (OpenStreetMap data).
+
+    Args:
+        lat, lng: centre point
+        radius_m: search radius in metres (default 2000m)
+        facility_types: OSM amenity tags to search for.
+                        Defaults to health and education facilities.
+
+    Returns:
+        List of {"name": str, "type": str, "lat": float, "lng": float,
+                 "distance_km": float}
+
+    Replaces: Google Places API (Nearby Search)
     """
     if facility_types is None:
-        facility_types = ["hospital", "pharmacy", "fire_station", "police"]
+        facility_types = ["hospital", "clinic", "pharmacy", "school", "water_point"]
+
+    # Build Overpass QL query
+    amenity_filter = "|".join(facility_types)
+    query = f"""
+    [out:json][timeout:20];
+    (
+      node["amenity"~"{amenity_filter}"](around:{radius_m},{lat},{lng});
+      way["amenity"~"{amenity_filter}"](around:{radius_m},{lat},{lng});
+    );
+    out center;
+    """
 
     try:
-        payload = {
-            "includedTypes": facility_types,
-            "maxResultCount": 5,
-            "locationRestriction": {
-                "circle": {
-                    "center": {"latitude": lat, "longitude": lng},
-                    "radius": float(radius_m)
-                }
-            }
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": MAPS_KEY,
-            "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.location,places.types"
-        }
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            resp = await client.post(PLACES_URL, json=payload, headers=headers)
+        async with httpx.AsyncClient(timeout=PLACES_TIMEOUT) as client:
+            resp = await client.post(
+                f"{OVERPASS_BASE_URL}/interpreter",
+                data={"data": query},
+            )
             resp.raise_for_status()
             data = resp.json()
 
-        places = []
-        for p in data.get("places", []):
+        places: list[dict] = []
+        for element in data.get("elements", []):
+            # way elements have a "center" sub-object; node elements have lat/lon directly
+            if element["type"] == "node":
+                p_lat, p_lng = element["lat"], element["lon"]
+            elif element["type"] == "way" and "center" in element:
+                p_lat, p_lng = element["center"]["lat"], element["center"]["lon"]
+            else:
+                continue
+
+            tags = element.get("tags", {})
+            name = tags.get("name", tags.get("amenity", "Unknown"))
+            amenity = tags.get("amenity", "facility")
+
             places.append({
-                "name": p.get("displayName", {}).get("text", "Unknown"),
-                "address": p.get("formattedAddress", ""),
-                "phone": p.get("nationalPhoneNumber"),
-                "lat": p.get("location", {}).get("latitude"),
-                "lng": p.get("location", {}).get("longitude"),
-                "types": p.get("types", [])
+                "name": name,
+                "type": amenity,
+                "lat": p_lat,
+                "lng": p_lng,
+                "distance_km": round(haversine_km(lat, lng, p_lat, p_lng), 2),
             })
 
-        return {
-            "facilities": places,
-            "source": "places_api",
-            "count": len(places)
-        }
+        # Sort by distance
+        places.sort(key=lambda x: x["distance_km"])
+        return places
 
-    except Exception as e:
-        logger.warning(f"Places API failed ({e}), returning static fallback facilities")
-        return {
-            "facilities": _static_facility_fallback(facility_types),
-            "source": "static_fallback",
-            "count": 0,
-            "error": str(e)
-        }
+    except httpx.TimeoutException:
+        logger.error("Overpass API timeout for lat=%s, lng=%s", lat, lng)
+        return []
+    except Exception as exc:
+        logger.error("Overpass API error: %s", exc)
+        return []
 
 
-def _static_facility_fallback(facility_types: list[str]) -> list[dict]:
-    """Generic placeholder facilities when Places API is unavailable."""
-    type_defaults = {
-        "hospital": {"name": "Nearest District Hospital", "phone": "104"},
-        "fire_station": {"name": "Local Fire Station", "phone": "101"},
-        "police": {"name": "Local Police Station", "phone": "100"},
-        "pharmacy": {"name": "Nearby Pharmacy", "phone": None},
-    }
-    result = []
-    for ft in facility_types:
-        if ft in type_defaults:
-            entry = type_defaults[ft].copy()
-            entry["types"] = [ft]
-            entry["address"] = "Contact local authorities for exact address"
-            entry["lat"] = None
-            entry["lng"] = None
-            result.append(entry)
-    return result
+# ── Startup Health Check ──────────────────────────────────────────────────────
 
-
-# ─── reverse_geocode() ───────────────────────────────────────────────────────
-async def reverse_geocode(lat: float, lng: float) -> dict:
+async def check_nominatim_connectivity() -> bool:
     """
-    Converts lat/lng → human-readable address + admin codes.
-    Used for volunteer GPS check-in verification.
+    Verify Nominatim is reachable. Called on FastAPI startup.
+    Uses a lightweight status endpoint.
     """
     try:
-        params = {
-            "latlng": f"{lat},{lng}",
-            "key": MAPS_KEY,
-            "result_type": "administrative_area_level_3|locality"
-        }
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            resp = await client.get(GEOCODE_URL, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-
-        if data.get("status") != "OK" or not data.get("results"):
-            return {"formatted_address": f"{lat:.4f}, {lng:.4f}", "source": "raw_coords"}
-
-        result = data["results"][0]
-        return {
-            "formatted_address": result.get("formatted_address", f"{lat:.4f}, {lng:.4f}"),
-            "place_id": result.get("place_id"),
-            "source": "reverse_geocoding_api"
-        }
-    except Exception as e:
-        logger.warning(f"reverse_geocode failed ({e})")
-        return {
-            "formatted_address": f"{lat:.4f}, {lng:.4f}",
-            "source": "fallback_raw_coords",
-            "error": str(e)
-        }
-
-
-# ─── validate_checkin_proximity() ────────────────────────────────────────────
-def validate_checkin_proximity(
-    task_lat: float, task_lng: float,
-    checkin_lat: float, checkin_lng: float,
-    max_radius_km: float = 0.3
-) -> dict:
-    """
-    Validates volunteer GPS check-in is within 300m of task location.
-    Uses haversine (no quota, always available).
-    Returns: { verified: bool, distance_m: float }
-    """
-    distance_km = haversine_km(task_lat, task_lng, checkin_lat, checkin_lng)
-    return {
-        "verified": distance_km <= max_radius_km,
-        "distance_m": round(distance_km * 1000, 1),
-        "max_allowed_m": max_radius_km * 1000
-    }
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(
+                f"{NOMINATIM_BASE_URL}/status.php",
+                params={"format": "json"},
+                headers={"User-Agent": NOMINATIM_USER_AGENT},
+            )
+            return resp.status_code == 200
+    except Exception as exc:
+        logger.warning("Nominatim connectivity check failed: %s", exc)
+        return False

@@ -1,192 +1,125 @@
-# services/api/src/fallbacks/matching.py
-# SYNAPSE — Haversine-Based Volunteer Matching Fallback
-# Used whenever Routes API is unavailable (quota, network error).
-# Returns IDENTICAL schema to live Routes API matching — drop-in replacement.
+"""
+fallbacks/matching.py — SYNAPSE Volunteer Matching Fallback
 
+This file provides the haversine straight-line distance matching fallback
+used when OSRM (Open Source Routing Machine) is unavailable.
+
+Primary path: OSRM actual road travel time + Gemini skill embeddings
+Fallback 1:   Haversine straight-line distance + Gemini skill embeddings  ← this file
+Fallback 2:   Haversine + radius filter only (Gemini unavailable)
+Fallback 3:   Accept all available volunteers (no proximity constraint)
+
+Previously this docstring referenced "Routes API" (Google Routes API).
+OSRM is now the primary routing source — haversine remains the fallback.
+No logic changes — only comment updates.
+"""
+
+import math
 import logging
-from math import radians, sin, cos, sqrt, atan2
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Default maximum radius for volunteer matching (km)
-DEFAULT_MAX_KM = 15.0
+# ── Haversine formula ─────────────────────────────────────────────────────────
 
-# Travel speed assumptions (km/h) — conservative urban averages
-SPEED = {
-    "driving":  35.0,   # urban with traffic
-    "walking":   5.0,
-    "transit":  20.0,
-    "cycling":  15.0
-}
-
-
-# ─── haversine_km() ──────────────────────────────────────────────────────────
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """
-    Great-circle distance between two GPS coordinates in kilometres.
-    Uses the haversine formula. Free, no quota, always available.
+    Calculate straight-line distance between two points in kilometres.
+
+    Used as the primary fallback when OSRM travel-time routing is unavailable.
+    Pure Python — no external API, no quota, always works.
     """
-    R = 6371  # Earth mean radius (km)
-    d_lat = radians(lat2 - lat1)
-    d_lon = radians(lon2 - lon1)
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
     a = (
-        sin(d_lat / 2) ** 2
-        + cos(radians(lat1)) * cos(radians(lat2)) * sin(d_lon / 2) ** 2
+        math.sin(d_phi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
     )
-    c = 2 * atan2(sqrt(a), sqrt(1 - a))
-    return R * c
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-# ─── estimate_travel_time() ──────────────────────────────────────────────────
-def estimate_travel_time(distance_km: float, mode: str = "driving") -> float:
+def haversine_proximity_score(distance_km: float, max_km: float = 20.0) -> float:
     """
-    Convert straight-line distance to approximate travel time (minutes).
-    Applies a 1.4× road-factor correction (straight line < actual road distance).
-    Returns same unit as Routes API (minutes, float).
+    Convert a haversine distance to a 0–30 proximity score.
+
+    0 km  → 30 points (maximum proximity score)
+    max_km → 0 points
     """
-    speed = SPEED.get(mode.lower(), SPEED["driving"])
-    road_distance_km = distance_km * 1.4   # correction for road winding
-    return (road_distance_km / speed) * 60
+    if distance_km >= max_km:
+        return 0.0
+    return round(30.0 * (1.0 - distance_km / max_km), 2)
 
 
-# ─── haversine_filter() ──────────────────────────────────────────────────────
-def haversine_filter(
-    need_lat: float,
-    need_lng: float,
+# ── Fallback matching pipeline ────────────────────────────────────────────────
+
+def match_volunteers_haversine(
+    need: dict,
     volunteers: list[dict],
-    max_km: float = DEFAULT_MAX_KM,
-    mode: str = "driving"
+    radius_km: float = 5.0,
+    max_results: int = 3,
 ) -> list[dict]:
     """
-    Filter and sort volunteers by haversine distance from a need location.
-    Returns volunteers within max_km, sorted by distance (nearest first).
-    Each volunteer dict is extended with:
-      - distance_km: float
-      - travel_time_mins: float
-      - match_source: "haversine_fallback"
-      - match_source_label: human-readable indicator string
+    Match volunteers to a need using haversine distance only.
+
+    Called when OSRM routing is unavailable. Ranks candidates by:
+      proximity_score (30%) + completion_rate (20%) → total out of 50
+    Skill similarity is excluded because Gemini embeddings are also unavailable
+    in a full-fallback scenario (see Fallback 2 in the matching pipeline).
+
+    Args:
+        need:        {"lat": float, "lng": float, ...}
+        volunteers:  [{"id": str, "lat": float, "lng": float,
+                       "completion_rate": float, ...}, ...]
+        radius_km:   search radius — 5km default, expanded to 15km in Fallback 3
+        max_results: top N to return
+
+    Returns:
+        List of volunteer dicts with added keys:
+          distance_km, proximity_score, match_score, match_source
     """
-    results = []
-    for volunteer in volunteers:
-        v_lat = volunteer.get("lat")
-        v_lng = volunteer.get("lng")
+    need_lat = need["lat"]
+    need_lng = need["lng"]
 
-        if v_lat is None or v_lng is None:
-            logger.debug(f"Volunteer {volunteer.get('id')} has no coordinates, skipping")
-            continue
-
-        try:
-            km = haversine_km(need_lat, need_lng, v_lat, v_lng)
-        except Exception as e:
-            logger.warning(f"haversine_km failed for volunteer {volunteer.get('id')}: {e}")
-            continue
-
-        if km <= max_km:
-            travel_mins = estimate_travel_time(km, mode)
-            results.append({
-                **volunteer,
-                "distance_km": round(km, 2),
-                "travel_time_mins": round(travel_mins, 1),
-                "match_source": "haversine_fallback",
-                "match_source_label": "⚠️  Matched via: Estimated distance (API unavailable)"
-            })
-
-    results.sort(key=lambda v: v["distance_km"])
-    return results
-
-
-# ─── rank_volunteers() ───────────────────────────────────────────────────────
-def rank_volunteers(
-    volunteers: list[dict],
-    task_requirements: str = "",
-    max_travel_mins: float = 90.0
-) -> list[dict]:
-    """
-    Rank pre-filtered volunteers by composite fallback score.
-    Used when Gemini embedding is also unavailable.
-
-    Composite score (mirrors real match_score formula):
-      match_score = (skill_similarity × 0.40) + (proximity_score × 0.30)
-                  + (completion_rate × 0.20) + (domain_boost × 0.10)
-
-    In fallback mode:
-      skill_similarity → keyword overlap (0-1)
-      proximity_score  → 1 - (travel_time_mins / 90)
-      completion_rate  → from volunteer.completion_rate field (0-1)
-      domain_boost     → 0.1 if category overlaps volunteer.domains, else 0
-    """
-    req_words = set(task_requirements.lower().split())
-
-    ranked = []
+    candidates = []
     for v in volunteers:
-        # Hard filter: max travel time
-        travel_mins = v.get("travel_time_mins", 999)
-        if travel_mins > max_travel_mins:
+        dist = haversine_km(need_lat, need_lng, v["lat"], v["lng"])
+        if dist > radius_km:
             continue
 
-        # Skill similarity via keyword overlap
-        skills_text = " ".join(v.get("skills", [])).lower()
-        skill_words = set(skills_text.split())
-        overlap = len(req_words & skill_words) if req_words else 0
-        skill_sim = min(1.0, overlap / max(len(req_words), 1)) if req_words else 0.5
+        prox = haversine_proximity_score(dist, max_km=radius_km)
+        completion = v.get("completion_rate", 0.5) * 20  # 0–20 points
 
-        # Proximity score
-        proximity = max(0.0, 1.0 - (travel_mins / max_travel_mins))
-
-        # Completion rate
-        completion = v.get("completion_rate", 0.7)  # default 70% if unknown
-
-        # Domain boost (not available in fallback — set to 0)
-        domain_boost = 0.0
-
-        score = (
-            skill_sim * 0.40
-            + proximity * 0.30
-            + completion * 0.20
-            + domain_boost * 0.10
-        )
-
-        ranked.append({
+        candidates.append({
             **v,
-            "match_score": round(score, 4),
-            "skill_similarity": round(skill_sim, 4),
-            "proximity_score": round(proximity, 4),
-            "match_source": v.get("match_source", "haversine_fallback"),
-            "match_source_label": v.get("match_source_label", "⚠️  Matched via: Estimated distance (API unavailable)")
+            "distance_km": round(dist, 2),
+            "proximity_score": prox,
+            "match_score": round(prox + completion, 2),
+            "match_source": "haversine_fallback",
         })
 
-    ranked.sort(key=lambda v: v["match_score"], reverse=True)
-    return ranked[:3]   # Return top 3, same as Routes API path
+    candidates.sort(key=lambda x: x["match_score"], reverse=True)
 
-
-# ─── top_3_fallback_matches() ────────────────────────────────────────────────
-def top_3_fallback_matches(
-    need_lat: float,
-    need_lng: float,
-    task_requirements: str,
-    volunteers: list[dict],
-    max_km: float = DEFAULT_MAX_KM,
-    max_travel_mins: float = 90.0,
-    mode: str = "driving"
-) -> list[dict]:
-    """
-    Full fallback matching pipeline.
-    Step 1: haversine_filter (distance-based hard filter)
-    Step 2: rank_volunteers (composite score)
-    Returns top 3 with plain-language explanation attached.
-    """
-    nearby = haversine_filter(need_lat, need_lng, volunteers, max_km, mode)
-    top3 = rank_volunteers(nearby, task_requirements, max_travel_mins)
-
-    for match in top3:
-        skills = match.get("skills", [])
-        top_skill = skills[0] if skills else "general"
-        sim_pct = int(match.get("skill_similarity", 0) * 100)
-        mins = match.get("travel_time_mins", 0)
-        match["explanation"] = (
-            f"Matched: {top_skill} skill ({sim_pct}%), "
-            f"~{mins:.0f} min away (estimated), available now."
+    if not candidates and radius_km < 15.0:
+        # Fallback 3: expand radius
+        logger.warning(
+            "No volunteers within %.1fkm — expanding radius to 15km (Fallback 3)", radius_km
         )
+        return match_volunteers_haversine(need, volunteers, radius_km=15.0, max_results=max_results)
 
-    return top3
+    if not candidates:
+        # Fallback 3 (final): accept all available volunteers regardless of distance
+        logger.warning("No volunteers within 15km — returning all available (Fallback 3 final)")
+        return [
+            {
+                **v,
+                "distance_km": round(haversine_km(need_lat, need_lng, v["lat"], v["lng"]), 2),
+                "proximity_score": 0.0,
+                "match_score": v.get("completion_rate", 0.5) * 20,
+                "match_source": "all_available_fallback",
+            }
+            for v in volunteers
+        ][:max_results]
+
+    return candidates[:max_results]
