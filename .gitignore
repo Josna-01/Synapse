@@ -1,0 +1,42 @@
+# Environment variables - NEVER commit these
+.env
+.env.local
+.env.development
+.env.production
+*.env
+
+# Firebase credentials - NEVER commit this
+firebase-credentials.json
+firebase-adminsdk*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+venv/
+.venv/
+env/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+build/
+npm-debug.log*
+
+# Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+*.g.dart
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
